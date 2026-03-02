@@ -41,11 +41,13 @@ type Config struct {
 	NoColor       bool
 	NoBanner      bool
 	ShowFields    []string
+	HideFields    []string
 	Quiet         int
 	TsharkPath    string
 	NtlmPassword  string
 	HideTransport bool
 	JSONOutput    string
+	CompareMode   string // "", "frame", or "field"
 	CompareFile   string
 }
 
@@ -77,9 +79,10 @@ type FieldEntry struct {
 
 // CompareField is a single field from a compare template file.
 type CompareField struct {
-	Name    string // field name (e.g. "http.response.code")
-	Value   string // expected value (only meaningful when Compare is true)
-	Compare bool   // true if this field had a * suffix (value comparison)
+	Name       string // field name (e.g. "http.response.code")
+	Value      string // expected value (only meaningful when Compare is true)
+	Compare    bool   // true if this field had a * suffix (field presence required, value diffed)
+	ExactMatch bool   // true if this field had a ** suffix (field AND value must match exactly)
 }
 
 // CompareTemplate holds a parsed compare template for field-level diffing.
@@ -275,7 +278,8 @@ func parseFlags() Config {
 		defaultInterface = "Ethernet"
 	}
 
-	var showFieldStr string
+	var showFieldStr, hideFieldStr string
+	var compareFrameFile, compareFieldFile string
 	var verboseFlag, veryVerboseFlag, quietFlag, veryQuietFlag bool
 
 	flag.StringVar(&config.Interface, "i", defaultInterface, "Network interface to capture on")
@@ -288,12 +292,14 @@ func parseFlags() Config {
 	flag.BoolVar(&verboseFlag, "v", false, "Display all fields for application layer protocols")
 	flag.BoolVar(&veryVerboseFlag, "vv", false, "Display all fields including transport/network layers")
 	flag.StringVar(&showFieldStr, "show-field", "", "Additional fields to display (comma separated, partial match)")
+	flag.StringVar(&hideFieldStr, "hide-field", "", "Fields to hide from output (comma separated, partial match)")
 	flag.StringVar(&config.DisplayFilter, "Y", defaultFilter, "Wireshark display filter")
 	flag.StringVar(&config.TsharkPath, "tshark", "", "Path to tshark executable")
 	flag.StringVar(&config.NtlmPassword, "ntlm-pass", "", "NTLM password for decrypting sealed sessions")
-	flag.BoolVar(&config.HideTransport, "hide-tcp-nego", false, "Hide transport-only packets (TCP handshakes, ACKs, etc.)")
+	flag.BoolVar(&config.HideTransport, "hide-transport", false, "Hide transport-only packets (TCP handshakes, ACKs, etc.)")
 	flag.StringVar(&config.JSONOutput, "w", "", "Write raw pcap output to file")
-	flag.StringVar(&config.CompareFile, "compare", "", "Template file for field comparison")
+	flag.StringVar(&compareFrameFile, "compare-frame", "", "Template: match by protocol + starred fields, show all fields")
+	flag.StringVar(&compareFieldFile, "compare-field", "", "Template: match and diff only starred fields across all protocols")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `Usage: gshark [options]
@@ -305,7 +311,7 @@ Input:
 
 Output:
   -Y string           Wireshark display filter (default "%s")
-  -hide-tcp-nego      Hide transport-only packets (TCP handshakes, ACKs, etc.)
+  -hide-transport     Hide transport-only packets (TCP handshakes, ACKs, etc.)
 
   -w string           Write raw pcap output to file
   -o string           Write gshark output to log file
@@ -314,14 +320,17 @@ Output:
   -no-banner          Suppress the gshark banner
 
 Verbosity:
-  -show-field string  Additional fields to display (comma separated list, returns partial matches)
+  -show-field string  Lines to display. Checks field names and field values. (comma separated list, returns partial matches)
+  -hide-field string  Lines to hide from output. Checks field names and field values. (comma separated, returns partial matches)
   -qq                 Very quiet mode: only display packets with matched fields. Use with -show-field
   -q                  Quiet mode: only display protocol headers
   -v                  Display all fields for application layer protocols
   -vv                 Display all fields including transport/network layers
 
 Compare:
-  -compare string     Template file for field comparison (fields ending with * are diffed)
+  -compare-frame string  Template: match by protocol + all starred fields, show all fields
+  -compare-field string  Template: match and diff only starred fields across all protocols
+                         Use * to diff a field, ** to require exact value match
 
 Decryption:
   -ntlm-pass string   NTLM password for decrypting sealed sessions (limited support)
@@ -339,6 +348,15 @@ Decryption:
 		}
 	}
 
+	// Parse hide-field values.
+	if hideFieldStr != "" {
+		for _, field := range strings.Split(hideFieldStr, ",") {
+			if trimmed := strings.TrimSpace(field); trimmed != "" {
+				config.HideFields = append(config.HideFields, trimmed)
+			}
+		}
+	}
+
 	if veryQuietFlag {
 		config.Quiet = 2
 	} else if quietFlag {
@@ -352,6 +370,19 @@ Decryption:
 		config.Verbose = 1
 	}
 
+	// Resolve compare mode from flags.
+	if compareFrameFile != "" && compareFieldFile != "" {
+		fmt.Fprintf(os.Stderr, "[!] Cannot use both -compare-frame and -compare-field\n")
+		os.Exit(1)
+	}
+	if compareFrameFile != "" {
+		config.CompareMode = "frame"
+		config.CompareFile = compareFrameFile
+	} else if compareFieldFile != "" {
+		config.CompareMode = "field"
+		config.CompareFile = compareFieldFile
+	}
+
 	// Validate flag combinations.
 	if config.Quiet > 0 && config.Verbose > 0 {
 		fmt.Fprintf(os.Stderr, "[!] Cannot combine quiet (-q/-qq) and verbose (-v/-vv) modes\n")
@@ -363,6 +394,14 @@ Decryption:
 	}
 	if config.JSONOutput != "" && config.PcapFile != "" {
 		fmt.Fprintf(os.Stderr, "[!] -w is only supported for live capture, not with -pcap\n")
+		os.Exit(1)
+	}
+	if config.CompareMode == "field" && (config.Quiet > 0 || config.Verbose > 0) {
+		fmt.Fprintf(os.Stderr, "[!] Cannot combine -compare-field with verbosity flags (-q/-qq/-v/-vv)\n")
+		os.Exit(1)
+	}
+	if config.CompareMode == "frame" && config.Quiet > 0 {
+		fmt.Fprintf(os.Stderr, "[!] Cannot combine -compare-frame with quiet flags (-q/-qq)\n")
 		os.Exit(1)
 	}
 
@@ -391,7 +430,7 @@ Decryption:
 	}
 
 	// Parse compare template file.
-	if config.CompareFile != "" {
+	if config.CompareMode != "" {
 		config.CompareFile = filepath.Clean(config.CompareFile)
 		var err error
 		compareTemplates, err = parseCompareFile(config.CompareFile)
@@ -458,22 +497,41 @@ func printStartupInfo() {
 	}
 
 	if len(config.ShowFields) > 0 {
-		fmt.Printf("[-] Additional fields: %s\n", strings.Join(config.ShowFields, ", "))
+		fmt.Printf("[-] Showing fields containing: %s\n", strings.Join(config.ShowFields, ", "))
+	}
+
+	if len(config.HideFields) > 0 {
+		fmt.Printf("[-] Hiding fields containing: %s\n", strings.Join(config.HideFields, ", "))
 	}
 
 	if config.NtlmPassword != "" {
 		fmt.Println("[-] NTLM decryption enabled")
 	}
-	if config.CompareFile != "" && len(compareTemplates) > 0 {
-		for i, tmpl := range compareTemplates {
-			compareCount := 0
+	if config.CompareMode != "" && len(compareTemplates) > 0 {
+		totalCompare := 0
+		for _, tmpl := range compareTemplates {
 			for _, f := range tmpl.Fields {
 				if f.Compare {
-					compareCount++
+					totalCompare++
 				}
 			}
-			fmt.Printf("[-] Compare template %d: %s (%d fields, %d compared)\n",
-				i+1, strings.ToUpper(tmpl.Protocol), len(tmpl.Fields), compareCount)
+		}
+		modeLabel := "frame"
+		if config.CompareMode == "field" {
+			modeLabel = "field"
+		}
+		fmt.Printf("[-] Compare %s mode: %s (%d compared fields)\n",
+			modeLabel, config.CompareFile, totalCompare)
+		for _, tmpl := range compareTemplates {
+			for _, f := range tmpl.Fields {
+				if f.Compare {
+					if f.ExactMatch {
+						fmt.Printf("    - %s: %s (exact)\n", f.Name, f.Value)
+					} else {
+						fmt.Printf("    - %s (diff)\n", f.Name)
+					}
+				}
+			}
 		}
 	}
 	if config.PcapFile != "" {
@@ -805,40 +863,122 @@ func formatPacketJSON(packet TSharkPacket) string {
 		}
 	}
 
+	// Filter out hidden fields (-hide-field).
+	// Matches against "name: value" line, same as -show-field.
+	if len(config.HideFields) > 0 {
+		var filtered []FieldEntry
+		for _, f := range uniqueFields {
+			line := strings.ToLower(f.Name + ": " + f.Value)
+			hide := false
+			for _, pattern := range config.HideFields {
+				if strings.Contains(line, strings.ToLower(pattern)) {
+					hide = true
+					break
+				}
+			}
+			if !hide {
+				filtered = append(filtered, f)
+			}
+		}
+		uniqueFields = filtered
+	}
+
 	// In very quiet mode (-qq), suppress packets with no matched fields.
 	if config.Quiet == 2 && len(uniqueFields) == 0 {
 		return ""
 	}
 
-	output.WriteString(headerLine)
-
 	// Build compare lookup if any template matches this packet.
 	// Match against all fields from layers, not just displayed fields.
 	var compareFields map[string]CompareField
-	if len(compareTemplates) > 0 {
+	if config.CompareMode != "" && len(compareTemplates) > 0 {
 		allFields := collectAllFields(layers, true)
 		for _, tmpl := range compareTemplates {
-			if matchesCompareTemplate(protocolName, allFields, tmpl) {
+			var matched bool
+			switch config.CompareMode {
+			case "frame":
+				matched = matchesCompareFrame(protocolKey, allFields, tmpl)
+			case "field":
+				matched = matchesCompareField(allFields, tmpl)
+			}
+			if matched {
 				compareFields = make(map[string]CompareField)
 				for _, cf := range tmpl.Fields {
 					if cf.Compare {
 						compareFields[cf.Name] = cf
 					}
 				}
-				// Ensure compare fields appear in output even if not in displayed fields.
-				displayedNames := make(map[string]bool)
-				for _, f := range uniqueFields {
-					displayedNames[f.Name] = true
-				}
-				for _, af := range allFields {
-					if _, isCompare := compareFields[af.Name]; isCompare && !displayedNames[af.Name] {
-						uniqueFields = append(uniqueFields, af)
-						displayedNames[af.Name] = true
+
+				if config.CompareMode == "frame" {
+					// Frame mode: template fields replace default fields.
+					// Reset uniqueFields and rebuild from template.
+					uniqueFields = nil
+					displayedNames := make(map[string]bool)
+
+					// Add all template fields (starred and non-starred) from packet.
+					templateFieldNames := make(map[string]bool)
+					for _, tf := range tmpl.Fields {
+						templateFieldNames[tf.Name] = true
+					}
+					for _, af := range allFields {
+						if templateFieldNames[af.Name] && !displayedNames[af.Name] {
+							uniqueFields = append(uniqueFields, af)
+							displayedNames[af.Name] = true
+						}
+					}
+
+					// With -v, add remaining app-layer fields.
+					if config.Verbose >= 1 {
+						appFields := collectAllFields(layers, false)
+						for _, af := range appFields {
+							if !displayedNames[af.Name] {
+								uniqueFields = append(uniqueFields, af)
+								displayedNames[af.Name] = true
+							}
+						}
+					}
+					// With -vv, also add transport/network fields.
+					if config.Verbose >= 2 {
+						for _, af := range allFields {
+							if !displayedNames[af.Name] {
+								uniqueFields = append(uniqueFields, af)
+								displayedNames[af.Name] = true
+							}
+						}
+					}
+				} else {
+					// Field mode: ensure compared fields are in display list.
+					displayedNames := make(map[string]bool)
+					for _, f := range uniqueFields {
+						displayedNames[f.Name] = true
+					}
+					for _, af := range allFields {
+						if _, isCompare := compareFields[af.Name]; isCompare && !displayedNames[af.Name] {
+							uniqueFields = append(uniqueFields, af)
+							displayedNames[af.Name] = true
+						}
 					}
 				}
 				break
 			}
 		}
+
+		// In compare mode, suppress packets that don't match any template.
+		if compareFields == nil {
+			return ""
+		}
+	}
+	output.WriteString(headerLine)
+
+	// In compare field mode, only show compared (starred) fields.
+	if compareFields != nil && config.CompareMode == "field" {
+		var compareEntries []FieldEntry
+		for _, f := range uniqueFields {
+			if _, ok := compareFields[f.Name]; ok {
+				compareEntries = append(compareEntries, f)
+			}
+		}
+		uniqueFields = compareEntries
 	}
 
 	// Render field tree.
@@ -855,12 +995,12 @@ func formatPacketJSON(packet TSharkPacket) string {
 			// Compare field: show actual value, then │ template value.
 			if f.Value == cf.Value {
 				// Values match: actual value green, template value white.
-				output.WriteString(fmt.Sprintf("  %s %s: %s  %s %s\n",
+				output.WriteString(fmt.Sprintf("  %s %s: %s %s %s\n",
 					protocolColor.Sprint(prefix), fieldNameColor.Sprint(f.Name),
 					greenColor.Sprint(f.Value), white.Sprint("│"), cf.Value))
 			} else {
 				// Values differ: actual value yellow, template value white.
-				output.WriteString(fmt.Sprintf("  %s %s: %s  %s %s\n",
+				output.WriteString(fmt.Sprintf("  %s %s: %s %s %s\n",
 					protocolColor.Sprint(prefix), fieldNameColor.Sprint(f.Name),
 					yellowColor.Sprint(f.Value), white.Sprint("│"), cf.Value))
 			}
@@ -1046,14 +1186,16 @@ func collectDefaultFields(layers map[string]interface{}, protocolKey string) []F
 	return fields
 }
 
-// collectShowFields returns fields whose name or value partially matches any
-// of the user-supplied -show-field patterns (case-insensitive).
+// collectShowFields returns fields whose name, value, or full "name: value"
+// line partially matches any of the user-supplied -show-field patterns
+// (case-insensitive). This allows matching on field name ("dns.qry.name"),
+// value ("TESTHOST"), or complete specification ("dns.qry.name: TESTHOST").
 func collectShowFields(layers map[string]interface{}, showFields []string) []FieldEntry {
 	var fields []FieldEntry
 	for _, f := range walkLayers(layers, false, "") {
+		line := strings.ToLower(f.Name + ": " + f.Value)
 		for _, show := range showFields {
-			if strings.Contains(strings.ToLower(f.Name), strings.ToLower(show)) ||
-				strings.Contains(strings.ToLower(f.Value), strings.ToLower(show)) {
+			if strings.Contains(line, strings.ToLower(show)) {
 				fields = append(fields, f)
 				break
 			}
@@ -1220,7 +1362,11 @@ func parseCompareFile(path string) ([]*CompareTemplate, error) {
 		value := fieldPart[sepIdx+2:]
 
 		cf := CompareField{Name: name}
-		if strings.HasSuffix(value, "*") {
+		if strings.HasSuffix(value, "**") {
+			cf.Compare = true
+			cf.ExactMatch = true
+			cf.Value = strings.TrimSuffix(value, "**")
+		} else if strings.HasSuffix(value, "*") {
 			cf.Compare = true
 			cf.Value = strings.TrimSuffix(value, "*")
 		} else {
@@ -1241,25 +1387,52 @@ func parseCompareFile(path string) ([]*CompareTemplate, error) {
 	return templates, nil
 }
 
-// matchesCompareTemplate checks if a packet matches the compare template by
-// protocol and field names. All template field names must be present.
-func matchesCompareTemplate(protocolName string, fields []FieldEntry, tmpl *CompareTemplate) bool {
-	if !strings.EqualFold(protocolName, tmpl.Protocol) {
+// matchesCompareField checks if a packet contains at least one starred field
+// from the template. Ignores protocol. For ** fields, the value must also
+// match exactly. Returns true if at least one starred field matches.
+func matchesCompareField(fields []FieldEntry, tmpl *CompareTemplate) bool {
+	have := make(map[string]string) // name -> value
+	for _, f := range fields {
+		have[f.Name] = f.Value
+	}
+	for _, tf := range tmpl.Fields {
+		if !tf.Compare {
+			continue
+		}
+		val, present := have[tf.Name]
+		if !present {
+			continue
+		}
+		if tf.ExactMatch && val != tf.Value {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// matchesCompareFrame checks if a packet matches a template by protocol and
+// field presence. Protocol must match (case-insensitive). ALL starred fields
+// must be present. For ** fields, the value must also match exactly.
+func matchesCompareFrame(proto string, fields []FieldEntry, tmpl *CompareTemplate) bool {
+	if !strings.EqualFold(proto, tmpl.Protocol) {
 		return false
 	}
-
-	// Build set of field names present in the packet.
-	have := make(map[string]bool)
+	have := make(map[string]string) // name -> value
 	for _, f := range fields {
-		have[f.Name] = true
+		have[f.Name] = f.Value
 	}
-
-	// Every template field name must exist in the packet.
 	for _, tf := range tmpl.Fields {
-		if !have[tf.Name] {
+		if !tf.Compare {
+			continue
+		}
+		val, present := have[tf.Name]
+		if !present {
+			return false
+		}
+		if tf.ExactMatch && val != tf.Value {
 			return false
 		}
 	}
-
 	return true
 }
