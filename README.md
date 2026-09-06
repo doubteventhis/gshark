@@ -1,7 +1,7 @@
 # Prerequisites
 requires tshark to be installed
 
-# Usage
+# Help
 ```
 Usage: gshark [options]
 
@@ -26,7 +26,6 @@ Verbosity:
   -qq                 Very quiet mode: only display packets with matched fields. Use with -show-field
   -q                  Quiet mode: only display protocol headers
   -v                  Display all fields including transport/network layers (frame/eth/ip/tcp/udp)
-                      (default already shows all application-layer fields)
 
 Compare:
   -compare-frame string  Template: match by protocol + all starred fields, show all fields
@@ -36,3 +35,10 @@ Compare:
 Decryption:
   -ntlm-pass string   NTLM password for decrypting sealed sessions (limited support)
 ```
+
+# Usage
+### view ntlm traffic during HTTP -> LDAP relay:
+`$ sudo ./gshark -Y 'not arp and not ssh' -hide-transport -q --show-field 'ntlmssp.messagetype,ntlmserverchallenge,ntproofstr,channel_bindings,target_name,dns_domain_name' -o relay.txt`  
+<img width="852" height="634" alt="image" src="https://github.com/user-attachments/assets/2696a847-6530-4734-ba1b-fbe2ad9c9766" />
+
+
