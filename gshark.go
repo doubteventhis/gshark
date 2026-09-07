@@ -4,12 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -93,6 +94,10 @@ type FieldEntry struct {
 
 // per protocol colors, add new protocols here
 var protocols = []ProtocolDef{
+	// icmp first: an icmp layer means the packet is an ICMP message on the wire,
+	// any higher layers tshark hoists out of it belong to the quoted packet
+	{Key: "icmp", Color: color.RGB(255, 100, 200)},
+	{Key: "icmpv6", Color: color.RGB(255, 100, 200)},
 	{Key: "ntlmssp", Color: color.New(color.FgHiRed)},
 	{Key: "kerberos", Color: color.New(color.FgMagenta)},
 	{Key: "smb2", Color: color.New(color.FgRed)},
@@ -106,7 +111,6 @@ var protocols = []ProtocolDef{
 	{Key: "mdns", Color: color.RGB(135, 206, 250)},
 	{Key: "dhcpv6", Color: color.New(color.FgGreen)},
 	{Key: "dcerpc", Color: color.New(color.FgHiCyan)},
-	{Key: "icmpv6", Color: color.RGB(255, 100, 200)},
 	{Key: "arp", Color: color.New(color.FgYellow)},
 	{Key: "ssdp", Color: color.New(color.FgHiYellow)},
 	{Key: "modbus", Color: color.New(color.FgHiGreen)},
@@ -120,10 +124,12 @@ var (
 	protocolPriorities []string
 )
 
-// lists transport/network layers excluded from output unless -v is used.
+// lists link/network/transport layers excluded from output unless -v is used.
+// 802.1Q / QinQ tag layers are here too, their IDs are shown on the header line instead
 var skipLayers = map[string]bool{
 	"frame": true, "frame_raw": true,
 	"eth": true, "eth_raw": true,
+	"vlan": true, "vlan_raw": true, "ieee8021ad": true, "ieee8021ad_raw": true,
 	"ip": true, "ipv6": true, "ip_raw": true, "ipv6_raw": true,
 	"tcp": true, "udp": true, "tcp_raw": true, "udp_raw": true,
 }
@@ -136,7 +142,6 @@ func init() {
 		protocolPriorities = append(protocolPriorities, p.Key)
 	}
 }
-
 
 func main() {
 	config = parseFlags()
@@ -152,9 +157,12 @@ func main() {
 	printStartupInfo()
 
 	// tshark args
+	// --no-duplicate-keys merges repeated keys (ip.addr, tcp.port, ...) into arrays,
+	// otherwise Go's JSON decoder keeps only the last one
 	tsharkArgs := []string{
 		"-l",
 		"-T", "json",
+		"--no-duplicate-keys",
 		"-Y", config.DisplayFilter,
 	}
 	if config.PcapFile != "" {
@@ -186,47 +194,8 @@ func main() {
 
 	tsharkCmd := findTshark(config.TsharkPath)
 
-	// start a separate process for raw pcap capture if -w is set
-	var pcapCmd *exec.Cmd
-	var pcapLabel string
-	if config.JSONOutput != "" && config.PcapFile == "" {
-
-		// use tshark on windows to write the pcap
-		if runtime.GOOS == "windows" {
-			pcapCmd = exec.Command(tsharkCmd, "-i", config.Interface, "-w", config.JSONOutput)
-			pcapLabel = "tshark-pcap"
-
-		// use tcpdump on linux
-		} else {
-			pcapCmd = exec.Command("tcpdump", "-i", config.Interface, "-w", config.JSONOutput)
-			pcapLabel = "tcpdump"
-		}
-
-		pcapStderr, _ := pcapCmd.StderrPipe()
-		if err := pcapCmd.Start(); err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Error starting pcap writer: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("[-] Writing pcap to %s\n", config.JSONOutput)
-		go func() {
-			scanner := bufio.NewScanner(pcapStderr)
-			for scanner.Scan() {
-				if line := scanner.Text(); line != "" {
-					fmt.Fprintf(os.Stderr, "[%s] %s\n", pcapLabel, line)
-				}
-			}
-		}()
-	}
-
-	// run tshark
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command(tsharkCmd, tsharkArgs...)
-
-	// linux uses stdbuf 
-	} else {
-		cmd = exec.Command("stdbuf", append([]string{"-oL", tsharkCmd}, tsharkArgs...)...)
-	}
+	// run tshark (-l already flushes stdout after every packet)
+	cmd := exec.Command(tsharkCmd, tsharkArgs...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -245,20 +214,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// on SIGINT/SIGTERM, kill both tshark processes
+	// on SIGINT/SIGTERM, kill tshark
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-
-		// stop pcap writer gracefully
-		if pcapCmd != nil && pcapCmd.Process != nil {
-			if runtime.GOOS == "windows" {
-				pcapCmd.Process.Kill()
-			} else {
-				pcapCmd.Process.Signal(syscall.SIGTERM)
-			}
-		}
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
@@ -284,19 +244,12 @@ func main() {
 
 		// suppress the "signal: killed" error from our own signal handler
 		if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == -1 {
-			if pcapCmd != nil {
-				pcapCmd.Wait()
-			}
 			return
 		}
 		fmt.Fprintf(os.Stderr, "[!] tshark exited with error: %v\n", err)
 		os.Exit(1)
 	}
-	if pcapCmd != nil {
-		pcapCmd.Wait()
-	}
 }
-
 
 // parses tsharks JSON array output, calls formatter, and prints line to stdout/logfile
 func processJSONOutput(stdout *bufio.Reader, logFile *os.File) {
@@ -316,7 +269,8 @@ func processJSONOutput(stdout *bufio.Reader, logFile *os.File) {
 	for decoder.More() {
 		var packet TSharkPacket
 		if err := decoder.Decode(&packet); err != nil {
-			if err.Error() == "unexpected EOF" || err.Error() == "EOF" {
+			// tshark closed its output (end of the pcap, or killed by our signal handler)
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			fmt.Fprintf(os.Stderr, "[!] Error decoding packet: %v\n", err)
@@ -372,9 +326,8 @@ func formatPacketJSON(packet TSharkPacket) string {
 		}
 	}
 
-
 	// find the protocol we're parsing
-	protocolKey, protocolName := detectProtocol(layers)
+	protocolKey, protocolName := detectProtocol(layers, order)
 	if config.HideTransport && skipLayers[protocolKey] {
 		return ""
 	}
@@ -418,15 +371,22 @@ func formatPacketJSON(packet TSharkPacket) string {
 		transport = fmt.Sprintf(" %s%s%s", white.Sprint("["), grey.Sprint("UDP"), white.Sprint("]"))
 	}
 
+	// 802.1Q / QinQ tags, outer tag first
+	var vlanStr string
+	vlanIDs := append(collectFieldValues(layers["ieee8021ad"], "ieee8021ad.id"), collectFieldValues(layers["vlan"], "vlan.id")...)
+	if len(vlanIDs) > 0 {
+		vlanStr = fmt.Sprintf(" %s%s%s", white.Sprint("["), grey.Sprintf("VLAN %s", strings.Join(vlanIDs, "/")), white.Sprint("]"))
+	}
+
 	var timestampStr string
 	if timestamp != "" {
 		timestampStr = fmt.Sprintf(" %s%s%s", white.Sprint("["), grey.Sprint(timestamp), white.Sprint("]"))
 	}
 
-	headerLine := fmt.Sprintf("%s%s%s %s%s %s %s%s%s%s\n",
+	headerLine := fmt.Sprintf("%s%s%s %s%s %s %s%s%s%s%s\n",
 		white.Sprint("["), protocolColor.Sprint(strings.ToUpper(protocolName)), white.Sprint("]"),
 		white.Sprint("["), white.Sprint(srcEndpoint), white.Sprint("->"), white.Sprint(dstEndpoint), white.Sprint("]"),
-		timestampStr, transport)
+		vlanStr, timestampStr, transport)
 
 	// collect fields based on verbosity level
 	var matchedFields []FieldEntry
@@ -593,9 +553,8 @@ func formatPacketJSON(packet TSharkPacket) string {
 	return output.String()
 }
 
-
-// detects the protocol from the tshark input
-func detectProtocol(layers map[string]interface{}) (string, string) {
+// detects the protocol from the tshark input. order is tshark's layer order, bottom of the stack first
+func detectProtocol(layers map[string]interface{}, order []string) (string, string) {
 
 	// check for known application-level protocols
 	for _, proto := range protocolPriorities {
@@ -607,15 +566,27 @@ func detectProtocol(layers map[string]interface{}) (string, string) {
 		}
 	}
 
-	// any layer not in skipLayers and not a known protocol. catches undefined protocols, uses tshark's name
-	for layerName := range layers {
-		if skipLayers[layerName] || strings.HasSuffix(layerName, "_raw") {
+	// any layer not in skipLayers and not a known protocol. catches undefined protocols, uses tshark's name.
+	// walk from the top of the stack down so the highest undefined layer wins deterministically
+	// (ranging over the map would pick one at random). tshark's own bookkeeping layers (_ws.*) never
+	// count, and "data" (undissected payload) only wins when nothing else is left
+	hasData := false
+	for i := len(order) - 1; i >= 0; i-- {
+		layerName := order[i]
+		if skipLayers[layerName] || strings.HasSuffix(layerName, "_raw") || strings.HasPrefix(layerName, "_ws.") {
 			continue
 		}
 		if _, isKnown := protocolColors[layerName]; isKnown {
 			continue
 		}
+		if layerName == "data" {
+			hasData = true
+			continue
+		}
 		return layerName, layerName
+	}
+	if hasData {
+		return "data", "data"
 	}
 
 	// fall back to transport-level known protocols (tcp, tls, ssh).
@@ -669,7 +640,24 @@ func findFieldValue(data interface{}, fieldName string) string {
 	return ""
 }
 
-// converts a JSON value to its string 
+// returns every value of fieldName found directly in data: an object, or an array of
+// objects for a layer that appears more than once in the packet
+func collectFieldValues(data interface{}, fieldName string) []string {
+	var values []string
+	switch v := data.(type) {
+	case map[string]interface{}:
+		if val, ok := v[fieldName]; ok {
+			values = append(values, valueToString(val))
+		}
+	case []interface{}:
+		for _, item := range v {
+			values = append(values, collectFieldValues(item, fieldName)...)
+		}
+	}
+	return values
+}
+
+// converts a JSON value to its string
 func valueToString(val interface{}) string {
 	switch v := val.(type) {
 	case string:
@@ -684,8 +672,14 @@ func valueToString(val interface{}) string {
 		}
 		return strings.Join(parts, ", ")
 	case map[string]interface{}:
-		for _, nested := range v {
-			if s, ok := nested.(string); ok {
+		// iterate in sorted key order, ranging over a map is randomized per run
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if s, ok := v[k].(string); ok {
 				return s
 			}
 		}
@@ -717,7 +711,7 @@ func walkLayers(layers map[string]interface{}, order []string, includeTransport 
 	return fields
 }
 
-// returns fields that match -show-field 
+// returns fields that match -show-field
 func collectShowFields(layers map[string]interface{}, order []string, showFields []string) []FieldEntry {
 	var fields []FieldEntry
 	for _, f := range walkLayers(layers, order, false, "") {
@@ -732,7 +726,7 @@ func collectShowFields(layers map[string]interface{}, order []string, showFields
 	return fields
 }
 
-// returns all fields from every layer. 
+// returns all fields from every layer.
 func collectAllFields(layers map[string]interface{}, order []string, includeTransport bool) []FieldEntry {
 	return walkLayers(layers, order, includeTransport, "")
 }
@@ -758,8 +752,18 @@ func flattenLayer(parentKey string, data interface{}) []FieldEntry {
 					fields = append(fields, FieldEntry{Name: key, Value: trimmed})
 				}
 			case []interface{}:
-				if strVal := valueToString(nested); strVal != "" && !strings.HasSuffix(key, "_tree") {
-					fields = append(fields, FieldEntry{Name: key, Value: strVal})
+				// merged duplicate keys (--no-duplicate-keys) arrive as arrays: scalars are
+				// joined into one value, objects (tls.record, *_tree, ...) are flattened
+				var scalars []string
+				for _, item := range nested {
+					if obj, isObj := item.(map[string]interface{}); isObj {
+						fields = append(fields, flattenLayer(key, obj)...)
+					} else if s := strings.TrimSpace(valueToString(item)); s != "" {
+						scalars = append(scalars, s)
+					}
+				}
+				if len(scalars) > 0 && !strings.HasSuffix(key, "_tree") {
+					fields = append(fields, FieldEntry{Name: key, Value: strings.Join(scalars, ", ")})
 				}
 			case map[string]interface{}:
 				fields = append(fields, flattenLayer(key, nested)...)
