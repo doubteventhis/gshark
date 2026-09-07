@@ -85,26 +85,27 @@ func parseCompareFile(path string) ([]*CompareTemplate, error) {
 			continue
 		}
 
-		// save field name and value
+		// save field name and value. markers go in front of the field name, since tshark
+		// field names never start with * while values can end in anything:
+		//   *name: value    diff this field
+		//   **name: value   require an exact value match
 		name := fieldPart[:sepIdx]
 		value := fieldPart[sepIdx+2:]
 
-		cf := CompareField{Name: name}
-
-		// check for exact match fields
-		if strings.HasSuffix(value, "**") {
+		cf := CompareField{Value: value}
+		switch {
+		case strings.HasPrefix(name, "**"):
 			cf.Compare = true
 			cf.ExactMatch = true
-			cf.Value = strings.TrimSuffix(value, "**")
-
-		// check for fields to compare
-		} else if strings.HasSuffix(value, "*") {
+			cf.Name = strings.TrimSpace(strings.TrimPrefix(name, "**"))
+		case strings.HasPrefix(name, "*"):
 			cf.Compare = true
-			cf.Value = strings.TrimSuffix(value, "*")
-
-		// save other fields in template
-		} else {
-			cf.Value = value
+			cf.Name = strings.TrimSpace(strings.TrimPrefix(name, "*"))
+		default:
+			cf.Name = name
+		}
+		if cf.Name == "" {
+			continue
 		}
 		current.Fields = append(current.Fields, cf)
 	}
@@ -120,6 +121,19 @@ func parseCompareFile(path string) ([]*CompareTemplate, error) {
 	}
 
 	return templates, nil
+}
+
+// counts the fields marked for comparison across all templates
+func countCompareFields(templates []*CompareTemplate) int {
+	n := 0
+	for _, tmpl := range templates {
+		for _, f := range tmpl.Fields {
+			if f.Compare {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // compare-fields mode. checks if a packet contains at least one field we're comparing
