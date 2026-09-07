@@ -31,7 +31,6 @@ type Config struct {
 	TsharkPath    string
 	NtlmPassword  string
 	HideTransport bool
-	JSONOutput    string
 	CompareMode   string
 	CompareFile   string
 }
@@ -71,7 +70,6 @@ func parseFlags() Config {
 	flag.StringVar(&config.TsharkPath, "tshark", "", "Path to tshark executable")
 	flag.StringVar(&config.NtlmPassword, "ntlm-pass", "", "NTLM password for decrypting sealed sessions")
 	flag.BoolVar(&config.HideTransport, "hide-transport", false, "Hide transport-only packets (TCP handshakes, ACKs, etc.)")
-	flag.StringVar(&config.JSONOutput, "w", "", "Write raw pcap output to file")
 	flag.StringVar(&compareFrameFile, "compare-frame", "", "Template: match by protocol + starred fields, show all fields")
 	flag.StringVar(&compareFieldFile, "compare-field", "", "Template: match and diff only starred fields across all protocols")
 	flag.Usage = func() {
@@ -85,8 +83,6 @@ Input:
 Output:
   -Y string           Wireshark display filter (default "%s")
   -hide-transport     Hide transport-only packets (TCP handshakes, ACKs, etc.)
-
-  -w string           Write raw pcap output to file
   -o string           Write gshark output to log file
 
   -no-color           Disable colored output
@@ -98,11 +94,12 @@ Verbosity:
   -qq                 Very quiet mode: only display packets with matched fields. Use with -show-field
   -q                  Quiet mode: only display protocol headers
   -v                  Display all fields including transport/network layers (frame/eth/ip/tcp/udp)
+                      (default already shows all application-layer fields)
 
 Compare:
   -compare-frame string  Template: match by protocol + all starred fields, show all fields
   -compare-field string  Template: match and diff only starred fields across all protocols
-                         Use * to diff a field, ** to require exact value match
+                         Star a field by putting * (diff) or ** (exact value match) in front of its name
 
 Decryption:
   -ntlm-pass string   NTLM password for decrypting sealed sessions (limited support)
@@ -157,10 +154,6 @@ Decryption:
 		fmt.Fprintf(os.Stderr, "[!] -qq requires -show-field to specify which fields to match\n")
 		os.Exit(1)
 	}
-	if config.JSONOutput != "" && config.PcapFile != "" {
-		fmt.Fprintf(os.Stderr, "[!] -w is only supported for live capture, not with -pcap\n")
-		os.Exit(1)
-	}
 	if config.CompareMode == "field" && (config.Quiet > 0 || config.Verbose > 0) {
 		fmt.Fprintf(os.Stderr, "[!] Cannot combine -compare-field with verbosity flags (-q/-qq/-v)\n")
 		os.Exit(1)
@@ -183,10 +176,6 @@ Decryption:
 		config.OutputLog = filepath.Clean(config.OutputLog)
 	}
 
-	if config.JSONOutput != "" {
-		config.JSONOutput = filepath.Clean(config.JSONOutput)
-	}
-
 	if config.TsharkPath != "" {
 		config.TsharkPath = filepath.Clean(config.TsharkPath)
 	}
@@ -198,6 +187,9 @@ Decryption:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] Error parsing compare file: %v\n", err)
 			os.Exit(1)
+		}
+		if countCompareFields(compareTemplates) == 0 {
+			fmt.Fprintf(os.Stderr, "[!] Warning: no fields are marked for comparison in %s (put * or ** in front of a field name)\n", config.CompareFile)
 		}
 	}
 
@@ -264,14 +256,7 @@ func printStartupInfo() {
 		fmt.Println("[-] NTLM decryption enabled")
 	}
 	if config.CompareMode != "" && len(compareTemplates) > 0 {
-		totalCompare := 0
-		for _, tmpl := range compareTemplates {
-			for _, f := range tmpl.Fields {
-				if f.Compare {
-					totalCompare++
-				}
-			}
-		}
+		totalCompare := countCompareFields(compareTemplates)
 		modeLabel := "frame"
 		if config.CompareMode == "field" {
 			modeLabel = "field"
