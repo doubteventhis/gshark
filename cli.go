@@ -94,7 +94,6 @@ Verbosity:
   -qq                 Very quiet mode: only display packets with matched fields. Use with -show-field
   -q                  Quiet mode: only display protocol headers
   -v                  Display all fields including transport/network layers (frame/eth/ip/tcp/udp)
-                      (default already shows all application-layer fields)
 
 Compare:
   -compare-frame string  Template: match by protocol + all starred fields, show all fields
