@@ -13,8 +13,6 @@ Input:
 Output:
   -Y string           Wireshark display filter (default "frame")
   -hide-transport     Hide transport-only packets (TCP handshakes, ACKs, etc.)
-
-  -w string           Write raw pcap output to file
   -o string           Write gshark output to log file
 
   -no-color           Disable colored output
@@ -30,13 +28,13 @@ Verbosity:
 Compare:
   -compare-frame string  Template: match by protocol + all starred fields, show all fields
   -compare-field string  Template: match and diff only starred fields across all protocols
-                         Use * to diff a field, ** to require exact value match
+                         Star a field by putting * (diff) or ** (exact value match) in front of its name
 
 Decryption:
   -ntlm-pass string   NTLM password for decrypting sealed sessions (limited support)
 ```
 
-# Usage
+# Examples
 ### view ntlm traffic during HTTP -> LDAP relay:
 `$ sudo ./gshark -Y 'not arp and not ssh' -hide-transport -q --show-field 'ntlmssp.messagetype,ntlmserverchallenge,ntproofstr,channel_bindings,target_name,dns_domain_name' -o relay.txt`  
 <img width="852" height="634" alt="image" src="https://github.com/user-attachments/assets/2696a847-6530-4734-ba1b-fbe2ad9c9766" />
