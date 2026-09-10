@@ -94,8 +94,6 @@ type FieldEntry struct {
 
 // per protocol colors, add new protocols here
 var protocols = []ProtocolDef{
-	// icmp first: an icmp layer means the packet is an ICMP message on the wire,
-	// any higher layers tshark hoists out of it belong to the quoted packet
 	{Key: "icmp", Color: color.RGB(255, 100, 200)},
 	{Key: "icmpv6", Color: color.RGB(255, 100, 200)},
 	{Key: "ntlmssp", Color: color.New(color.FgHiRed)},
@@ -124,8 +122,7 @@ var (
 	protocolPriorities []string
 )
 
-// lists link/network/transport layers excluded from output unless -v is used.
-// 802.1Q / QinQ tag layers are here too, their IDs are shown on the header line instead
+// set link/network/transport layers excluded from output unless -v is used
 var skipLayers = map[string]bool{
 	"frame": true, "frame_raw": true,
 	"eth": true, "eth_raw": true,
@@ -157,8 +154,6 @@ func main() {
 	printStartupInfo()
 
 	// tshark args
-	// --no-duplicate-keys merges repeated keys (ip.addr, tcp.port, ...) into arrays,
-	// otherwise Go's JSON decoder keeps only the last one
 	tsharkArgs := []string{
 		"-l",
 		"-T", "json",
@@ -194,7 +189,7 @@ func main() {
 
 	tsharkCmd := findTshark(config.TsharkPath)
 
-	// run tshark (-l already flushes stdout after every packet)
+	// run tshark
 	cmd := exec.Command(tsharkCmd, tsharkArgs...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -239,6 +234,9 @@ func main() {
 
 	// process packets until tshark exits
 	processJSONOutput(bufio.NewReader(stdout), logFile)
+
+	// report template frames that never appeared (compare-frame mode)
+	printAbsentCompareFrames()
 
 	if err := cmd.Wait(); err != nil {
 
@@ -328,9 +326,6 @@ func formatPacketJSON(packet TSharkPacket) string {
 
 	// find the protocol we're parsing
 	protocolKey, protocolName := detectProtocol(layers, order)
-	if config.HideTransport && skipLayers[protocolKey] {
-		return ""
-	}
 
 	// check the assigned color or assign cyan
 	protocolColor := protocolColors[protocolKey]
@@ -371,7 +366,7 @@ func formatPacketJSON(packet TSharkPacket) string {
 		transport = fmt.Sprintf(" %s%s%s", white.Sprint("["), grey.Sprint("UDP"), white.Sprint("]"))
 	}
 
-	// 802.1Q / QinQ tags, outer tag first
+	// build vlan string
 	var vlanStr string
 	vlanIDs := append(collectFieldValues(layers["ieee8021ad"], "ieee8021ad.id"), collectFieldValues(layers["vlan"], "vlan.id")...)
 	if len(vlanIDs) > 0 {
@@ -438,67 +433,56 @@ func formatPacketJSON(packet TSharkPacket) string {
 		return ""
 	}
 
-	// build compare lookup if any template matches this packet, match against all fields from layers, not just displayed fields
+	// compare against template(s). frame mode aligns each packet to a template block and
+	// prints a full-frame diff; field mode augments the display list with compared fields.
 	var compareFields map[string]CompareField
 	if config.CompareMode != "" && len(compareTemplates) > 0 {
 		allFields := collectAllFields(layers, order, true)
+
+		// frame mode: align to the best-matching template block, then diff the whole frame.
+		// ** fields are alignment keys (must be present and equal); every other field is
+		// diffed automatically and is never a match requirement. among eligible blocks the
+		// one sharing the most field names with the packet wins.
+		if config.CompareMode == "frame" {
+			fvals, frameOrder := fieldValueMap(allFields)
+			var best *CompareTemplate
+			bestScore := 0
+			for _, tmpl := range compareTemplates {
+				if ok, score := alignCompareFrame(protocolKey, fvals, tmpl); ok && score > bestScore {
+					best, bestScore = tmpl, score
+				}
+			}
+			// no template block aligned: suppress the frame entirely
+			if best == nil {
+				return ""
+			}
+			compareFrameHits[best] = true
+			showTransport := config.Verbose >= 1 || templateHasTransport(best)
+			return headerLine + renderFrameDiff(protocolColor, best, fvals, frameOrder, showTransport)
+		}
+
+		// field mode: augment the display list with compared fields present in the packet
 		for _, tmpl := range compareTemplates {
-			var matched bool
-			switch config.CompareMode {
-			case "frame":
-				matched = matchesCompareFrame(protocolKey, allFields, tmpl)
-			case "field":
-				matched = matchesCompareField(allFields, tmpl)
+			if !matchesCompareField(allFields, tmpl) {
+				continue
 			}
-			if matched {
-				compareFields = make(map[string]CompareField)
-				for _, cf := range tmpl.Fields {
-					if cf.Compare {
-						compareFields[cf.Name] = cf
-					}
+			compareFields = make(map[string]CompareField)
+			for _, cf := range tmpl.Fields {
+				if cf.Compare {
+					compareFields[cf.Name] = cf
 				}
-
-				// in compare-frame mode
-				if config.CompareMode == "frame" {
-					uniqueFields = nil
-					displayedNames := make(map[string]bool)
-
-					// add all template fields from packet
-					templateFieldNames := make(map[string]bool)
-					for _, tf := range tmpl.Fields {
-						templateFieldNames[tf.Name] = true
-					}
-					for _, af := range allFields {
-						if templateFieldNames[af.Name] && !displayedNames[af.Name] {
-							uniqueFields = append(uniqueFields, af)
-							displayedNames[af.Name] = true
-						}
-					}
-
-					// with -v, add all remaining fields
-					if config.Verbose >= 1 {
-						for _, af := range allFields {
-							if !displayedNames[af.Name] {
-								uniqueFields = append(uniqueFields, af)
-								displayedNames[af.Name] = true
-							}
-						}
-					}
-				} else {
-					// compare-fied mode, ensure compared fields are in display list
-					displayedNames := make(map[string]bool)
-					for _, f := range uniqueFields {
-						displayedNames[f.Name] = true
-					}
-					for _, af := range allFields {
-						if _, isCompare := compareFields[af.Name]; isCompare && !displayedNames[af.Name] {
-							uniqueFields = append(uniqueFields, af)
-							displayedNames[af.Name] = true
-						}
-					}
-				}
-				break
 			}
+			displayedNames := make(map[string]bool)
+			for _, f := range uniqueFields {
+				displayedNames[f.Name] = true
+			}
+			for _, af := range allFields {
+				if _, isCompare := compareFields[af.Name]; isCompare && !displayedNames[af.Name] {
+					uniqueFields = append(uniqueFields, af)
+					displayedNames[af.Name] = true
+				}
+			}
+			break
 		}
 
 		// suppress packets that don't match any template.
@@ -508,13 +492,18 @@ func formatPacketJSON(packet TSharkPacket) string {
 	}
 	output.WriteString(headerLine)
 
-	// compare-field mode, only show compared fields
+	// compare-field mode, only show compared fields (with -hide-matches, drop the ones that match)
 	if compareFields != nil && config.CompareMode == "field" {
 		var compareEntries []FieldEntry
 		for _, f := range uniqueFields {
-			if _, ok := compareFields[f.Name]; ok {
-				compareEntries = append(compareEntries, f)
+			cf, ok := compareFields[f.Name]
+			if !ok {
+				continue
 			}
+			if config.HideMatches && f.Value == cf.Value {
+				continue
+			}
+			compareEntries = append(compareEntries, f)
 		}
 		uniqueFields = compareEntries
 	}
@@ -553,6 +542,157 @@ func formatPacketJSON(packet TSharkPacket) string {
 	return output.String()
 }
 
+// compareFrameHits records which template blocks matched at least one packet, so
+// printAbsentCompareFrames can report template frames that never appeared in the capture.
+var compareFrameHits = map[*CompareTemplate]bool{}
+
+// fieldValueMap groups field entries by name into a value multiset and records first-seen order.
+func fieldValueMap(fields []FieldEntry) (map[string][]string, []string) {
+	m := make(map[string][]string)
+	var order []string
+	for _, f := range fields {
+		if _, ok := m[f.Name]; !ok {
+			order = append(order, f.Name)
+		}
+		m[f.Name] = append(m[f.Name], f.Value)
+	}
+	return m, order
+}
+
+// multisetEqual reports whether two value slices hold the same values regardless of order.
+func multisetEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ac := append([]string(nil), a...)
+	bc := append([]string(nil), b...)
+	sort.Strings(ac)
+	sort.Strings(bc)
+	for i := range ac {
+		if ac[i] != bc[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// isSkipLayerField reports whether a field belongs to a link/network/transport layer.
+func isSkipLayerField(name string) bool {
+	if i := strings.IndexByte(name, '.'); i > 0 {
+		return skipLayers[name[:i]]
+	}
+	return skipLayers[name]
+}
+
+// prints a diff of a captured frame against a template
+func renderFrameDiff(protocolColor *color.Color, tmpl *CompareTemplate, fvals map[string][]string, frameOrder []string, showTransport bool) string {
+	yellow := color.New(color.FgYellow)
+	green := color.New(color.FgGreen)
+	red := color.New(color.FgRed)
+	gray := color.RGB(180, 180, 180)
+	dim := color.New(color.FgHiBlack)
+	white := color.New(color.FgHiWhite, color.Bold)
+
+	// template values and first-seen order
+	tvals := make(map[string][]string)
+	var torder []string
+	for _, tf := range tmpl.Fields {
+		if _, ok := tvals[tf.Name]; !ok {
+			torder = append(torder, tf.Name)
+		}
+		tvals[tf.Name] = append(tvals[tf.Name], tf.Value)
+	}
+
+	// union of names: template order first, then capture-only names in capture order
+	var names []string
+	seen := make(map[string]bool)
+	for _, n := range torder {
+		if !seen[n] {
+			names = append(names, n)
+			seen[n] = true
+		}
+	}
+	for _, n := range frameOrder {
+		if seen[n] || (!showTransport && isSkipLayerField(n)) {
+			continue
+		}
+		names = append(names, n)
+		seen[n] = true
+	}
+
+	type piece struct {
+		name string
+		body string
+	}
+	var pieces []piece
+	for _, n := range names {
+		tv, inT := tvals[n]
+		fv, inF := fvals[n]
+		var body string
+		switch {
+		case inT && inF:
+			if multisetEqual(tv, fv) {
+				if config.HideMatches {
+					continue
+				}
+				body = fmt.Sprintf("%s %s %s", green.Sprint(strings.Join(fv, ", ")), white.Sprint("│"), strings.Join(tv, ", "))
+			} else {
+				body = fmt.Sprintf("%s %s %s", yellow.Sprint(strings.Join(fv, ", ")), white.Sprint("│"), strings.Join(tv, ", "))
+			}
+		case inT && !inF:
+			body = fmt.Sprintf("%s %s %s", red.Sprint("(absent)"), white.Sprint("│"), strings.Join(tv, ", "))
+		case !inT && inF:
+			// capture-only field: not defined in the template, so nothing to match. shown plain
+			body = strings.Join(fv, ", ")
+		}
+		pieces = append(pieces, piece{n, body})
+	}
+
+	if len(pieces) == 0 {
+		return "  " + protocolColor.Sprint("└─") + " " + dim.Sprint("(no differences)") + "\n"
+	}
+
+	var b strings.Builder
+	for i, p := range pieces {
+		prefix := "├─"
+		if i == len(pieces)-1 {
+			prefix = "└─"
+		}
+		b.WriteString(fmt.Sprintf("  %s %s: %s\n", protocolColor.Sprint(prefix), gray.Sprint(p.name), p.body))
+	}
+	return b.String()
+}
+
+// printAbsentCompareFrames reports template frames (frame mode) that never matched a packet.
+func printAbsentCompareFrames() {
+	if config.CompareMode != "frame" {
+		return
+	}
+	var missing []*CompareTemplate
+	for _, t := range compareTemplates {
+		if !compareFrameHits[t] {
+			missing = append(missing, t)
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	fmt.Printf("\n[!] %d template frame(s) had no match in the capture:\n", len(missing))
+	for _, t := range missing {
+		var keys []string
+		for _, f := range t.Fields {
+			if f.ExactMatch {
+				keys = append(keys, f.Name+"="+f.Value)
+			}
+		}
+		detail := ""
+		if len(keys) > 0 {
+			detail = " (" + strings.Join(keys, ", ") + ")"
+		}
+		fmt.Printf("    - [%s]%s\n", strings.ToUpper(t.Protocol), detail)
+	}
+}
+
 // detects the protocol from the tshark input. order is tshark's layer order, bottom of the stack first
 func detectProtocol(layers map[string]interface{}, order []string) (string, string) {
 
@@ -566,10 +706,7 @@ func detectProtocol(layers map[string]interface{}, order []string) (string, stri
 		}
 	}
 
-	// any layer not in skipLayers and not a known protocol. catches undefined protocols, uses tshark's name.
-	// walk from the top of the stack down so the highest undefined layer wins deterministically
-	// (ranging over the map would pick one at random). tshark's own bookkeeping layers (_ws.*) never
-	// count, and "data" (undissected payload) only wins when nothing else is left
+	// any layer not in skipLayers and not a known protocol. catches undefined protocols
 	hasData := false
 	for i := len(order) - 1; i >= 0; i-- {
 		layerName := order[i]
@@ -640,8 +777,7 @@ func findFieldValue(data interface{}, fieldName string) string {
 	return ""
 }
 
-// returns every value of fieldName found directly in data: an object, or an array of
-// objects for a layer that appears more than once in the packet
+// returns every value of fieldName found
 func collectFieldValues(data interface{}, fieldName string) []string {
 	var values []string
 	switch v := data.(type) {
@@ -672,7 +808,7 @@ func valueToString(val interface{}) string {
 		}
 		return strings.Join(parts, ", ")
 	case map[string]interface{}:
-		// iterate in sorted key order, ranging over a map is randomized per run
+		// iterate in sorted key order
 		keys := make([]string, 0, len(v))
 		for k := range v {
 			keys = append(keys, k)
@@ -752,8 +888,6 @@ func flattenLayer(parentKey string, data interface{}) []FieldEntry {
 					fields = append(fields, FieldEntry{Name: key, Value: trimmed})
 				}
 			case []interface{}:
-				// merged duplicate keys (--no-duplicate-keys) arrive as arrays: scalars are
-				// joined into one value, objects (tls.record, *_tree, ...) are flattened
 				var scalars []string
 				for _, item := range nested {
 					if obj, isObj := item.(map[string]interface{}); isObj {
