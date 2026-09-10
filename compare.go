@@ -85,8 +85,7 @@ func parseCompareFile(path string) ([]*CompareTemplate, error) {
 			continue
 		}
 
-		// save field name and value. markers go in front of the field name, since tshark
-		// field names never start with * while values can end in anything:
+		// save field name and value. markers go in front of the field name
 		//   *name: value    diff this field
 		//   **name: value   require an exact value match
 		name := fieldPart[:sepIdx]
@@ -158,26 +157,41 @@ func matchesCompareField(fields []FieldEntry, tmpl *CompareTemplate) bool {
 	return false
 }
 
-// compare-frame mode. checks packets for the specified protocol and fields
-func matchesCompareFrame(proto string, fields []FieldEntry, tmpl *CompareTemplate) bool {
+// compare-frame mode. the frame's protocol must equal the template's, and every ** field (alignment key) must be present with an equal value. all other template fields are diffed 
+func alignCompareFrame(proto string, fvals map[string][]string, tmpl *CompareTemplate) (bool, int) {
 	if !strings.EqualFold(proto, tmpl.Protocol) {
-		return false
+		return false, 0
 	}
-	have := make(map[string]string)
-	for _, f := range fields {
-		have[f.Name] = f.Value
-	}
+	score := 0
+	counted := make(map[string]bool)
 	for _, tf := range tmpl.Fields {
-		if !tf.Compare {
-			continue
+		vals, present := fvals[tf.Name]
+		if tf.ExactMatch && (!present || !containsValue(vals, tf.Value)) {
+			return false, 0
 		}
-		val, present := have[tf.Name]
-		if !present {
-			return false
-		}
-		if tf.ExactMatch && val != tf.Value {
-			return false
+		if present && !counted[tf.Name] {
+			score++
+			counted[tf.Name] = true
 		}
 	}
-	return true
+	return true, score
+}
+
+func containsValue(vals []string, v string) bool {
+	for _, x := range vals {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// check whether a template block references any link/network/transpor layer field
+func templateHasTransport(tmpl *CompareTemplate) bool {
+	for _, tf := range tmpl.Fields {
+		if isSkipLayerField(tf.Name) {
+			return true
+		}
+	}
+	return false
 }
